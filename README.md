@@ -84,14 +84,16 @@ python group-quota-requester.py auto-rebalance \
 
 **How it works (each cycle):**
 
-1. Lists all subscriptions in the group quota
-2. Queries compute usage (`currentValue` / `limit`) for the specified resource in each subscription
-3. Prints a usage summary table
-4. Identifies the **target** — subscription with the highest usage %
-5. Identifies **donors** — subscriptions at or below the `--donor-threshold` usage %
-6. Reclaims spare cores from each donor (PATCHes their allocation down to their current usage)
-7. Allocates the total reclaimed cores to the target (PATCHes its allocation up)
-8. Sleeps for `--interval` seconds before the next cycle
+1. **Discover subscriptions** — calls the Group Quota API to list all subscription IDs enrolled in the group quota.
+2. **Collect usage** — for each subscription, queries the Compute usage API (`Microsoft.Compute/locations/{location}/usages`) for the specified VM family. This returns `currentValue` (cores in use) and `limit` (allocated quota). Subscriptions with `limit=0` or missing data are skipped.
+3. **Print a summary table** — shows every subscription sorted by usage %, so you can see the state at a glance.
+4. **Pick the target** — the subscription with the highest usage % receives the quota. If even the highest-usage subscription is at or below the donor threshold, the cycle is skipped — nobody needs help.
+5. **Pick the donors** — any subscription whose usage % is at or below the `--donor-threshold` (and isn't the target) is a donor.
+6. **Reclaim from donors** — for each donor, calculates `spare = limit - currentValue` (cores allocated but not in use). PATCHes the donor's allocation down to its `currentValue`, freeing those spare cores back to the group pool.
+7. **Allocate to target** — sums up all successfully reclaimed cores and PATCHes the target's allocation up by that amount (`current target limit + total reclaimed`).
+8. **Sleep and repeat** — waits `--interval` seconds, then runs the next cycle.
+
+Quota allocation in Group Quotas works as a shared pool: lowering a donor's allocation returns cores to the pool, and raising the target's allocation draws from it. This tool automates the "take from idle, give to busy" pattern that would otherwise require manual PATCH calls.
 
 Press `Ctrl+C` to stop the loop.
 
@@ -268,5 +270,4 @@ python group-quota-fetcher.py group-limit-snapshot \
 - [Share Quota Across Subscriptions](https://learn.microsoft.com/en-us/azure/quotas/quota-groups)
 - [Create/Delete Quota Groups](https://learn.microsoft.com/en-us/azure/quotas/create-quota-groups)
 - [Add/Remove Subscriptions](https://learn.microsoft.com/en-us/azure/quotas/add-remove-subscriptions-quota-group)
-- [Transfer Quota](https://learn.microsoft.com/en-us/azure/quotas/transfer-quota-groups)
 - [Group Limit Increase](https://learn.microsoft.com/en-us/azure/quotas/quota-group-limit-increase)
