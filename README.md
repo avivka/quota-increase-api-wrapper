@@ -68,37 +68,39 @@ python group-quota-requester.py remove-subscription \
   --subscription-id 00000000-0000-0000-0000-000000000000
 ```
 
-#### `transfer-quota` — Transfer quota to a subscription
+#### `auto-rebalance` — Automatically redistribute quota across subscriptions
 
-Single operation:
+Runs a continuous loop that scans all subscriptions in the group, identifies which subscription needs quota most (highest usage %), reclaims spare quota from low-usage donor subscriptions (at or below the donor threshold), and allocates it to the target.
 
 ```bash
-python group-quota-requester.py transfer-quota \
+python group-quota-requester.py auto-rebalance \
   --management-group-id myMgmtGroup \
   --group-quota-name myGroupQuota \
-  --subscription-id 00000000-0000-0000-0000-000000000000 \
   --location eastus \
-  --resource-name standardddv4family \
-  --limit 50
+  --resource-name standardDSv4Family \
+  --donor-threshold 40 \
+  --interval 300
 ```
 
-Batch mode (CSV):
+**How it works (each cycle):**
 
-```bash
-python group-quota-requester.py transfer-quota \
-  --management-group-id myMgmtGroup \
-  --group-quota-name myGroupQuota \
-  --subscription-id 00000000-0000-0000-0000-000000000000 \
-  --csv-file-path transfers.csv
-```
+1. Lists all subscriptions in the group quota
+2. Queries compute usage (`currentValue` / `limit`) for the specified resource in each subscription
+3. Prints a usage summary table
+4. Identifies the **target** — subscription with the highest usage %
+5. Identifies **donors** — subscriptions at or below the `--donor-threshold` usage %
+6. Reclaims spare cores from each donor (PATCHes their allocation down to their current usage)
+7. Allocates the total reclaimed cores to the target (PATCHes its allocation up)
+8. Sleeps for `--interval` seconds before the next cycle
 
-CSV format (`transfers.csv`):
+Press `Ctrl+C` to stop the loop.
 
-```csv
-location,resource_name,limit
-eastus,standardddv4family,50
-westus2,standarddsv5family,30
-```
+| Option | Description | Default |
+|---|---|---|
+| `--location` | Azure region to rebalance | Required |
+| `--resource-name` | VM family to rebalance (e.g. `standardDSv4Family`) | Required |
+| `--donor-threshold` | Subs at or below this usage % are donors | `40` |
+| `--interval` | Seconds between rebalance cycles | `300` |
 
 #### `request-limit-increase` — Request a group quota limit increase
 
@@ -231,14 +233,12 @@ python group-quota-requester.py request-limit-increase \
   --limit 200 \
   --comment "Production scaling"
 
-# 5. Transfer quota to a specific subscription
-python group-quota-requester.py transfer-quota \
+# 5. Auto-rebalance quota across subscriptions
+python group-quota-requester.py auto-rebalance \
   --management-group-id myMgmtGroup \
   --group-quota-name myGroupQuota \
-  --subscription-id sub-id-1 \
   --location eastus \
-  --resource-name standardddv4family \
-  --limit 100
+  --resource-name standardDSv4Family
 
 # 6. Check allocation snapshot
 python group-quota-fetcher.py allocation-snapshot \

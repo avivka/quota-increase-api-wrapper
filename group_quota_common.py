@@ -100,3 +100,39 @@ def add_group_quota_name_arg(parser):
         '--group-quota-name', type=str, required=True,
         help='Name of the group quota'
     )
+
+
+def list_group_subscriptions(management_group_id, group_quota_name, api_version=DEFAULT_API_VERSION):
+    """List all subscription IDs enrolled in a group quota."""
+    url = (
+        f"{MGMT_BASE_URL}/providers/Microsoft.Management"
+        f"/managementGroups/{management_group_id}"
+        f"/providers/Microsoft.Quota/groupQuotas/{group_quota_name}"
+        f"/subscriptions?api-version={api_version}"
+    )
+    status_code, response = make_request("GET", url)
+    if status_code != 200:
+        print(f"Failed to list group subscriptions: Status {status_code}, Response: {response}")
+        return []
+    return [
+        entry["properties"]["subscriptionId"]
+        for entry in response.get("value", [])
+    ]
+
+
+def get_compute_usage(subscription_id, location, resource_name):
+    """Get current usage and limit for a specific compute resource in a subscription."""
+    url = (
+        f"{MGMT_BASE_URL}/subscriptions/{subscription_id}"
+        f"/providers/Microsoft.Compute/locations/{location}"
+        f"/usages?api-version=2024-07-01"
+    )
+    status_code, response = make_request("GET", url)
+    if status_code != 200:
+        print(f"Failed to get compute usage for {subscription_id}: Status {status_code}, Response: {response}")
+        return None
+    for entry in response.get("value", []):
+        if entry.get("name", {}).get("value", "").lower() == resource_name.lower():
+            return (entry["currentValue"], entry["limit"])
+    print(f"Resource '{resource_name}' not found in usage data for subscription {subscription_id}")
+    return None

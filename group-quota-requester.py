@@ -1,10 +1,14 @@
 import csv
+import time
+import datetime
 import argparse
 from group_quota_common import (
     make_request,
     build_group_quota_base_url,
     add_common_args,
     add_group_quota_name_arg,
+    list_group_subscriptions,
+    get_compute_usage,
     MGMT_BASE_URL,
 )
 
@@ -67,12 +71,13 @@ def remove_subscription(args):
           f"Status Code: {status_code}, Response: {response}")
 
 
-def transfer_quota_single(args, location, resource_name, limit):
+def patch_allocation(subscription_id, group_quota_name, location, resource_name, limit, api_version):
+    """PATCH quota allocation for a subscription."""
     url = (
-        f"{MGMT_BASE_URL}/subscriptions/{args.subscription_id}"
-        f"/providers/Microsoft.Quota/groupQuotas/{args.group_quota_name}"
+        f"{MGMT_BASE_URL}/subscriptions/{subscription_id}"
+        f"/providers/Microsoft.Quota/groupQuotas/{group_quota_name}"
         f"/quotaAllocations/{location}"
-        f"?api-version={args.api_version}"
+        f"?api-version={api_version}"
     )
     payload = {
         "properties": {
@@ -87,18 +92,116 @@ def transfer_quota_single(args, location, resource_name, limit):
         }
     }
     status_code, response = make_request("PATCH", url, payload)
-    print(f"Transfer Quota (sub={args.subscription_id}, location={location}, "
-          f"resource={resource_name}, limit={limit}): "
-          f"Status Code: {status_code}, Response: {response}")
+    return status_code, response
 
 
-def transfer_quota(args):
-    if args.csv_file_path:
-        rows = read_csv(args.csv_file_path)
-        for row in rows:
-            transfer_quota_single(args, row['location'], row['resource_name'], row['limit'])
-    else:
-        transfer_quota_single(args, args.location, args.resource_name, args.limit)
+def auto_rebalance(args):
+    print(f"Starting auto-rebalance loop (interval={args.interval}s, donor threshold={args.donor_threshold}%)")
+    print(f"  Management Group: {args.management_group_id}")
+    print(f"  Group Quota:      {args.group_quota_name}")
+    print(f"  Location:         {args.location}")
+    print(f"  Resource:         {args.resource_name}")
+    print()
+
+    try:
+        while True:
+            print(f"=== Rebalance cycle at {datetime.datetime.now().isoformat()} ===")
+
+            # 1. List subscriptions
+            sub_ids = list_group_subscriptions(
+                args.management_group_id, args.group_quota_name, args.api_version
+            )
+            if not sub_ids:
+                print("No subscriptions found in group quota. Skipping cycle.")
+                time.sleep(args.interval)
+                continue
+
+            # 2. Gather usage for each subscription
+            usage_data = []
+            for sub_id in sub_ids:
+                result = get_compute_usage(sub_id, args.location, args.resource_name)
+                if result is None:
+                    continue
+                current_value, limit = result
+                if limit == 0:
+                    print(f"  Skipping {sub_id}: limit is 0")
+                    continue
+                usage_pct = (current_value / limit) * 100
+                usage_data.append({
+                    "subscription_id": sub_id,
+                    "current_value": current_value,
+                    "limit": limit,
+                    "usage_pct": usage_pct,
+                })
+
+            if not usage_data:
+                print("No usage data available. Skipping cycle.")
+                time.sleep(args.interval)
+                continue
+
+            # 3. Print usage summary table
+            print(f"\n{'Subscription':<40} {'Used':>6} {'Limit':>6} {'Usage%':>7}")
+            print("-" * 62)
+            for entry in sorted(usage_data, key=lambda x: x["usage_pct"], reverse=True):
+                print(f"{entry['subscription_id']:<40} {entry['current_value']:>6} {entry['limit']:>6} {entry['usage_pct']:>6.1f}%")
+            print()
+
+            # 4. Identify target (highest usage %) and donors (<= threshold)
+            target = max(usage_data, key=lambda x: x["usage_pct"])
+            donors = [
+                e for e in usage_data
+                if e["usage_pct"] <= args.donor_threshold
+                and e["subscription_id"] != target["subscription_id"]
+            ]
+
+            if not donors:
+                print("No donor subscriptions available (none at or below threshold). Skipping cycle.")
+                time.sleep(args.interval)
+                continue
+
+            if target["usage_pct"] <= args.donor_threshold:
+                print(f"Target subscription usage ({target['usage_pct']:.1f}%) is at or below threshold. No rebalance needed.")
+                time.sleep(args.interval)
+                continue
+
+            # 5. Reclaim spare quota from donors
+            total_reclaimed = 0
+            for donor in donors:
+                spare = donor["limit"] - donor["current_value"]
+                if spare <= 0:
+                    continue
+                new_limit = donor["current_value"]
+                print(f"Reclaiming {spare} cores from {donor['subscription_id']} (limit {donor['limit']} -> {new_limit})")
+                status_code, response = patch_allocation(
+                    donor["subscription_id"], args.group_quota_name,
+                    args.location, args.resource_name, new_limit, args.api_version
+                )
+                if status_code == 200:
+                    total_reclaimed += spare
+                else:
+                    print(f"  Failed to reclaim from {donor['subscription_id']}: Status {status_code}, Response: {response}")
+
+            if total_reclaimed == 0:
+                print("No quota reclaimed from donors. Skipping allocation to target.")
+                time.sleep(args.interval)
+                continue
+
+            # 6. Allocate reclaimed quota to target
+            new_target_limit = target["limit"] + total_reclaimed
+            print(f"\nAllocating {total_reclaimed} reclaimed cores to {target['subscription_id']} "
+                  f"(limit {target['limit']} -> {new_target_limit})")
+            status_code, response = patch_allocation(
+                target["subscription_id"], args.group_quota_name,
+                args.location, args.resource_name, new_target_limit, args.api_version
+            )
+            if status_code != 200:
+                print(f"  Failed to allocate to target: Status {status_code}, Response: {response}")
+
+            print(f"\nCycle complete. Reclaimed {total_reclaimed} cores total.\n")
+            time.sleep(args.interval)
+
+    except KeyboardInterrupt:
+        print("\nAuto-rebalance stopped by user.")
 
 
 def request_limit_increase_single(args, location, resource_name, limit, comment=None):
@@ -180,16 +283,15 @@ def main():
     rm_sub_parser.add_argument('--subscription-id', type=str, required=True, help='Subscription ID to remove')
     rm_sub_parser.set_defaults(func=remove_subscription)
 
-    # transfer-quota
-    transfer_parser = subparsers.add_parser('transfer-quota', help='Transfer quota to a subscription')
-    add_common_args(transfer_parser)
-    add_group_quota_name_arg(transfer_parser)
-    transfer_parser.add_argument('--subscription-id', type=str, required=True, help='Target subscription ID')
-    transfer_parser.add_argument('--csv-file-path', type=str, help='CSV file with columns: location,resource_name,limit')
-    transfer_parser.add_argument('--location', type=str, help='Azure region (e.g. eastus)')
-    transfer_parser.add_argument('--resource-name', type=str, help='Resource/SKU family name (e.g. standardddv4family)')
-    transfer_parser.add_argument('--limit', type=int, help='Quota limit to transfer')
-    transfer_parser.set_defaults(func=transfer_quota)
+    # auto-rebalance
+    rebalance_parser = subparsers.add_parser('auto-rebalance', help='Automatically redistribute quota from low-usage to high-usage subscriptions')
+    add_common_args(rebalance_parser)
+    add_group_quota_name_arg(rebalance_parser)
+    rebalance_parser.add_argument('--location', type=str, required=True, help='Azure region to rebalance (e.g. eastus)')
+    rebalance_parser.add_argument('--resource-name', type=str, required=True, help='VM family to rebalance (e.g. standardDSv4Family)')
+    rebalance_parser.add_argument('--donor-threshold', type=float, default=40, help='Subs at or below this usage %% are donors (default: 40)')
+    rebalance_parser.add_argument('--interval', type=int, default=300, help='Seconds between rebalance cycles (default: 300)')
+    rebalance_parser.set_defaults(func=auto_rebalance)
 
     # request-limit-increase
     increase_parser = subparsers.add_parser('request-limit-increase', help='Request a group quota limit increase')
